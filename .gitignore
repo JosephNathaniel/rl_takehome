@@ -1,3 +1,6 @@
+# My addition: Ignore output directory
+output/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

@@ -31,7 +31,7 @@ def eval_on_test_set(
     round_num: int
 ) -> tuple[dict[str, float], float]:
     """
-    Evaluate model performance on test set.
+    Evaluate model performance on test set in a distributed manner.
     
     Args:
         model: The model to evaluate
@@ -43,23 +43,45 @@ def eval_on_test_set(
         round_num: Current training round number
         
     Returns:
-        total_scores: Dictionary of average metrics
-        accuracy: Accuracy on test set
+        total_scores: Dictionary of average metrics on rank 0, otherwise empty.
+        accuracy: Accuracy on test set on rank 0, otherwise 0.
     """
-    print("Running evaluation on test set...")
-    
-    # Track metrics across all test examples
-    total_scores = defaultdict(float)
-    num_examples = 0
-    total_accuracy = 0.0
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
 
-    # Create log file for this evaluation round
-    log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
-    test_loader.reset()
+    if rank == 0:
+        print("Running evaluation on test set...")
     
-    with open(log_file, 'w') as f:
+    model.eval()
+
+    # Create a sampler for the test set
+    test_dataset = test_loader.dataset
+    test_sampler = DistributedSampler(
+        test_dataset,
+        num_replicas=world_size,
+        rank=rank,
+        shuffle=False
+    )
+    
+    def collate_fn(batch):
+        return tuple(zip(*batch))
+
+    distributed_test_loader = TorchDataLoader(
+        test_dataset,
+        batch_size=1, # Process one question per GPU at a time
+        sampler=test_sampler,
+        collate_fn=collate_fn
+    )
+
+    # Track metrics across all test examples locally
+    local_total_scores = defaultdict(float)
+    local_num_examples = 0
+    local_total_accuracy = 0.0
+    
+    with torch.no_grad():
         # Run through test set
-        for question, answer in tqdm(test_loader, desc="Evaluating on test set"):
+        for batch in tqdm(distributed_test_loader, desc=f"Evaluating on test set (Rank {rank})", disable=(rank != 0)):
+            question, answer = batch[0][0], batch[1][0]
             # Generate completions using same function as training
             _, _, _, _, completions_text, _ = generate_completions(
                 model, tokenizer, question, device, args, test_loader
@@ -70,48 +92,66 @@ def eval_on_test_set(
             mock_completions = [[{'content': completion}] for completion in completions_text]
             # Make answer array same length as completions
             answers = [answer] * len(completions_text)
-            rewards_per_func, metrics = eval_class.compute_rewards(
+            _, metrics = eval_class.compute_rewards(
                 prompts=mock_prompts,
                 completions=mock_completions, 
                 answer=answers,
                 device=device
             )
             
-            # Track accuracy and accumulate metrics
-            total_accuracy += metrics['accuracy']
+            # Track accuracy and accumulate metrics locally
+            local_total_accuracy += metrics['accuracy']
                 
             for k, v in metrics.items():
+                local_total_scores[k] += v
+            local_num_examples += 1
+
+    model.train()
+
+    # Gather results from all processes
+    all_process_metrics = [None] * world_size
+    dist.all_gather_object(all_process_metrics, {
+        'scores': dict(local_total_scores),
+        'accuracy': local_total_accuracy,
+        'examples': local_num_examples
+    })
+
+    avg_scores = {}
+    accuracy = 0.0
+    if rank == 0:
+        total_scores = defaultdict(float)
+        total_accuracy = 0.0
+        num_examples = 0
+        
+        # Create log file for this evaluation round
+        log_file = os.path.join(args.output_dir, f'eval_metrics_{round_num}.txt')
+        with open(log_file, 'w') as f:
+            f.write("Metrics are aggregated across all GPUs.\n")
+
+        for metrics_data in all_process_metrics:
+            if not metrics_data: continue
+            for k, v in metrics_data['scores'].items():
                 total_scores[k] += v
-            num_examples += 1
+            total_accuracy += metrics_data['accuracy']
+            num_examples += metrics_data['examples']
 
-            # Log this example
-            f.write("\n" + "="*50 + "\n")
-            f.write(f"Q# {num_examples}\n")
-            f.write(f"Question: {question}\n")
-            f.write(f"Response: {completions_text[0]}\n") # Log first completion
-            f.write(f"Ground Truth: {answer}\n")
-            f.write("Metrics:\n")
-            for metric, value in metrics.items():
-                f.write(f"{metric}: {value}\n")
-            f.write(f"Total Score: {rewards_per_func.sum().item()}\n")
+        # Calculate averages
+        if num_examples > 0:
+            avg_scores = {k: v/num_examples for k,v in total_scores.items()}
+            accuracy = total_accuracy / num_examples * 100
 
+        # Save metrics
+        metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
+        with open(metrics_path, 'w') as f:
+            json.dump({**avg_scores, 'accuracy': accuracy}, f, indent=4)
 
-    # Calculate averages
-    avg_scores = {k: v/num_examples for k,v in total_scores.items()}
-    accuracy = total_accuracy / num_examples * 100
-
-    # Save metrics
-    metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
-    with open(metrics_path, 'w') as f:
-        json.dump({**avg_scores, 'accuracy': accuracy}, f, indent=4)
-
-    if args.verbose:
-        print("\nEvaluation Results:")
-        print("-" * 20)
-        print(f"Accuracy: {accuracy:.2f}%")
-        for metric, value in avg_scores.items():
-            print(f"{metric:15s}: {value:.4f}")
-        print("-" * 20)
+        if args.verbose:
+            print("\nEvaluation Results:")
+            print("-" * 20)
+            print(f"Accuracy: {accuracy:.2f}%")
+            for metric, value in avg_scores.items():
+                print(f"{metric:15s}: {value:.4f}")
+            print("-" * 20)
 
     return avg_scores, accuracy
 
@@ -573,7 +613,8 @@ if __name__ == "__main__":
         train_sampler.set_epoch(round_num)
 
         # Evaluate on test set every so often 
-        if round_num % args.eval_iterations == 0 and rank == 0:
+        if round_num % args.eval_iterations == 0:
+            dist.barrier()
             eval_metrics, eval_accuracy = eval_on_test_set(
                 model=model.module,
                 tokenizer=tokenizer, 
@@ -583,14 +624,16 @@ if __name__ == "__main__":
                 args=args,
                 round_num=round_num
             )
+            dist.barrier()
             
-            # Save metrics to eval log dir
-            metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
-            with open(metrics_path, 'w') as f:
-                json.dump({
-                    'metrics': eval_metrics,
-                    'accuracy': eval_accuracy
-                }, f, indent=4)
+            # Save metrics to eval log dir (only on rank 0)
+            if rank == 0:
+                metrics_path = os.path.join(eval_log_dir, f'metrics_{round_num}.json')
+                with open(metrics_path, 'w') as f:
+                    json.dump({
+                        'metrics': eval_metrics,
+                        'accuracy': eval_accuracy
+                    }, f, indent=4)
 
         # Slowly update ref model
         if args.update_ref_model and (round_num+1) % args.update_ref_model_freq == 0:

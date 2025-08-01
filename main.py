@@ -164,11 +164,13 @@ def generate_completions(
     )
 
     # Generate completions
-    prompt_completion_ids = model.generate(
-        prompt_ids,
-        attention_mask=prompt_mask,
-        generation_config=generation_config
-    )
+    # My note: added torch no grad
+    with torch.no_grad():
+        prompt_completion_ids = model.generate(
+            prompt_ids,
+            attention_mask=prompt_mask,
+            generation_config=generation_config
+        )
 
     # Extract completion ids
     prompt_length = prompt_ids.size(1)
@@ -325,8 +327,11 @@ def compute_loss(
     # Per token policy objective
     # NOTE: I think there's something dodgy here with the importance sampling ratio
     # because we're using the model, rather than the base_model, to generate rollouts
-    pg_objective = advantages.unsqueeze(-1) * torch.exp(log_probs - base_log_probs)
+    # pg_objective = advantages.unsqueeze(-1) * torch.exp(log_probs - base_log_probs)
     # again, this will need masking
+
+    # ALTERNATIVE VERSION:
+    pg_objective = advantages.unsqueeze(-1) * log_probs
 
     per_token_loss = -pg_objective + args.kl_weight_beta * kl
     per_token_loss = per_token_loss * completion_mask  # Apply completion mask

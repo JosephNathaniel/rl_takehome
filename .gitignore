@@ -1,5 +1,6 @@
-# My addition: Ignore output directory
+# My addition: Ignore output, .vscode directories
 output/
+.vscode/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

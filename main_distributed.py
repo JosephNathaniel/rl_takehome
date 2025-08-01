@@ -77,6 +77,7 @@ def eval_on_test_set(
     local_total_scores = defaultdict(float)
     local_num_examples = 0
     local_total_accuracy = 0.0
+    local_log_data = []
     
     with torch.no_grad():
         # Run through test set
@@ -92,7 +93,7 @@ def eval_on_test_set(
             mock_completions = [[{'content': completion}] for completion in completions_text]
             # Make answer array same length as completions
             answers = [answer] * len(completions_text)
-            _, metrics = eval_class.compute_rewards(
+            rewards_per_func, metrics = eval_class.compute_rewards(
                 prompts=mock_prompts,
                 completions=mock_completions, 
                 answer=answers,
@@ -106,6 +107,18 @@ def eval_on_test_set(
                 local_total_scores[k] += v
             local_num_examples += 1
 
+            # Log this example
+            log_string = "\n" + "="*50 + "\n"
+            log_string += f"Q# {local_num_examples}\n"
+            log_string += f"Question: {question}\n"
+            log_string += f"Response: {completions_text[0]}\n" # My note: ONLY LOG THE FIRST COMPLETION
+            log_string += f"Ground Truth: {answer}\n"
+            log_string += "Metrics:\n"
+            for metric, value in metrics.items():
+                log_string += f"{metric}: {value}\n"
+            log_string += f"Total Score: {rewards_per_func.sum().item()}\n"
+            local_log_data.append(log_string)
+
     model.train()
 
     # Gather results from all processes
@@ -113,7 +126,8 @@ def eval_on_test_set(
     dist.all_gather_object(all_process_metrics, {
         'scores': dict(local_total_scores),
         'accuracy': local_total_accuracy,
-        'examples': local_num_examples
+        'examples': local_num_examples,
+        'logs': local_log_data
     })
 
     avg_scores = {}
@@ -128,12 +142,14 @@ def eval_on_test_set(
         with open(log_file, 'w') as f:
             f.write("Metrics are aggregated across all GPUs.\n")
 
+        all_logs = []
         for metrics_data in all_process_metrics:
             if not metrics_data: continue
             for k, v in metrics_data['scores'].items():
                 total_scores[k] += v
             total_accuracy += metrics_data['accuracy']
             num_examples += metrics_data['examples']
+            all_logs.extend(metrics_data['logs'])
 
         # Calculate averages
         if num_examples > 0:
@@ -144,6 +160,18 @@ def eval_on_test_set(
         metrics_path = os.path.join(args.output_dir, f'eval_metrics_{round_num}.json')
         with open(metrics_path, 'w') as f:
             json.dump({**avg_scores, 'accuracy': accuracy}, f, indent=4)
+        
+        with open(log_file, 'a') as f:
+            f.write(f"\nSummary Metrics:\n")
+            f.write(f"Accuracy: {accuracy:.2f}%\n")
+            for metric, value in avg_scores.items():
+                f.write(f"{metric:15s}: {value:.4f}\n")
+            
+            f.write("\n\n" + "="*50 + "\n")
+            f.write("Individual Examples:\n")
+            f.write("="*50 + "\n")
+            for log_entry in all_logs:
+                f.write(log_entry)
 
         if args.verbose:
             print("\nEvaluation Results:")

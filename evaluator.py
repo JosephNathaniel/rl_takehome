@@ -8,6 +8,17 @@ import torch
 from abc import ABC, abstractmethod
 from typing import List, Dict, Tuple, Any
 
+# Pre-compile once
+STRICT_RE = re.compile(
+    r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>\s*",
+    re.DOTALL
+)
+# Allow *any* text between the tags for soft checking
+SOFT_RE = re.compile(
+    r"<reasoning>.*?</reasoning>.*?<answer>.*?</answer>",
+    re.DOTALL
+)
+
 class RewardEvaluator(ABC):
     """
     Abstract base class for reward computation in RL training.
@@ -116,34 +127,42 @@ class GSM8kEvaluator(RewardEvaluator):
 
     def _strict_format_reward(self, completions) -> List[float]:
         """Reward for strict XML format."""
-        pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
-        responses = [completion[0]["content"] for completion in completions]
-        matches = [bool(re.match(pattern, r)) for r in responses]
-        return [0.5 if m else 0.0 for m in matches]
+        rewards = []
+        for c in completions:
+            text = c[0]["content"]
+            # fullmatch ensures nothing but tags & whitespace
+            ok = bool(STRICT_RE.fullmatch(text))
+            rewards.append(0.5 if ok else 0.0)
+        return rewards
 
     def _soft_format_reward(self, completions) -> List[float]:
         """Reward for relaxed XML format."""
-        pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-        responses = [completion[0]["content"] for completion in completions]
-        matches = [bool(re.match(pattern, r)) for r in responses]
-        return [0.5 if m else 0.0 for m in matches]
+        rewards = []
+        for c in completions:
+            text = c[0]["content"]
+            ok = bool(SOFT_RE.search(text))
+            rewards.append(0.5 if ok else 0.0)
+        return rewards
 
     def _xml_count_reward(self, completions) -> List[float]:
         """Reward for XML tag counting."""
-        def count_xml(text: str) -> float:
-            count = 0.0
-            if text.count("<reasoning>\n") == 1: count += 0.125
-            if text.count("\n</reasoning>\n") == 1: count += 0.125
-            if text.count("\n<answer>\n") == 1:
-                count += 0.125
-                count -= len(text.split("\n</answer>\n")[-1])*0.001
-            if text.count("\n</answer>") == 1:
-                count += 0.125
-                count -= (len(text.split("\n</answer>")[-1]) - 1)*0.001
-            return count
-            
-        responses = [completion[0]["content"] for completion in completions]
-        return [count_xml(r) for r in responses]
+        rewards = []
+        for c in completions:
+            text = c[0]["content"]
+            score = 0.0
+            # Each tag exactly once
+            for tag in ("<reasoning>","</reasoning>","<answer>","</answer>"):
+                if text.count(tag) == 1:
+                    score += 0.125
+            # Penalty for extra text before or after the XML
+            before, _, after = text.partition("<reasoning>")
+            tail = ""
+            if "</answer>" in text:
+                tail = text.split("</answer>",1)[1]
+            score -= (len(before.strip()) + len(tail.strip())) * 0.001
+            # Never go below zero
+            rewards.append(max(score, 0.0))
+        return rewards
 
     def compute_rewards(
         self,

@@ -143,6 +143,7 @@ def generate_completions(
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
     # Truncate prompt to max length and repeat for number of generations
+    # My note: I believe, if it's already shorter than max length, then nothing happens
     prompt_ids = prompt_ids[:, -args.max_prompt_length:]
     prompt_mask = prompt_mask[:, -args.max_prompt_length:]
     
@@ -181,6 +182,8 @@ def generate_completions(
     sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
     completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
 
+    # My note: (batch_size, seq_length)? batch_size is number of parallel generations
+    # I think this is just a padding mask for the completion part
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
     # Decode completions
@@ -297,9 +300,49 @@ def compute_loss(
         metrics: Dictionary containing additional metrics (response length and kl divergence)
     """
 
-    # TO-DO
-    loss = torch.tensor(0.0, requires_grad=True)
-    metrics = {}
+    # Get per-token logprobs from the current model
+    log_probs = utils.get_per_token_logps(
+        model,
+        prompt_completion_ids,
+        attention_mask,
+        logits_to_keep=completion_ids.size(1)
+    )
+    # My note: log_probs is now (num_chains, completion_length)
+
+    # Get per-token logprobs from the base model
+    with torch.no_grad():
+        base_log_probs = utils.get_per_token_logps(
+            base_model,
+            prompt_completion_ids,
+            attention_mask,
+            logits_to_keep=completion_ids.size(1)
+        )
+
+    # Next, calculate per token KL divergence between current and base model
+    kl = torch.exp(base_log_probs - log_probs) - (base_log_probs - log_probs) - 1
+    # kl is shape (batch, completion_length), same as completion_mask. We'll need to mask later.
+
+    # Per token policy objective
+    # NOTE: I think there's something dodgy here with the importance sampling ratio
+    # because we're using the model, rather than the base_model, to generate rollouts
+    pg_objective = advantages.unsqueeze(-1) * torch.exp(log_probs - base_log_probs)
+    # again, this will need masking
+
+    per_token_loss = -pg_objective + args.kl_weight_beta * kl
+    per_token_loss = per_token_loss * completion_mask  # Apply completion mask
+
+    # average along completion length
+    per_completion_loss = per_token_loss.sum(dim=1) / completion_mask.sum(dim=1)
+    # mean across batch
+    loss = per_completion_loss.mean()
+
+    # Prepare metrics for logging
+    # TODO: what metrics do we want?
+    metrics = {
+        "response_length": completion_mask.sum(dim=1).float().mean().item(),
+        "kl": kl.mean().item(),
+        "learning_rate": args.learning_rate  # Assuming args has learning rate
+    }
 
     return loss, metrics
 
@@ -336,11 +379,16 @@ def grpo_loss(
         reward: The total reward for this batch
     """
     # Generate completions
+    # My note: each tensor is 2D, with batch dim = num_chains as 0th
+    # My note: three seq lengths at play. Prompt length, completion length, prompt+completion length
+    # My note: attention mask same shape as prompt_completion_ids
     prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text = generate_completions(
         model, tokenizer, question, device, args
     )
+    # My note: if we're already using the normal model to rollout, doesn't this make the importance ratio redundant?
 
     # Score completions
+    # My note: rewards, advantages are shape (num_chains). Same "advantage" is given to each token in a given completion!
     rewards, advantages, rewards_per_func, metrics, log_data = score_completions(
         completions_text, question, answer, eval_class, device, args
     )
@@ -350,6 +398,7 @@ def grpo_loss(
     utils.write_generation_log(log_data, log_file)
 
     # Compute loss
+    # My note: completion_mask same shape as completion_ids
     completion_mask = attention_mask[:, prompt_ids.size(1):]
     loss, loss_metrics = compute_loss(
         model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
@@ -467,6 +516,7 @@ if __name__ == "__main__":
     accumulated_loss = 0
     optimizer.zero_grad()
     train_metrics_total = {}
+    # My note: this loop corresponds to getting a new (question, answer) pair?
     for round_num in tqdm(range(args.num_train_iters), desc="Training Progress"):
     
         # Evaluate on test set every so often 
@@ -496,6 +546,7 @@ if __name__ == "__main__":
                     ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
 
         # Get next question
+        # My note: a single (q,a) pair. Two strings? Answer is a minimal string
         question, answer = next(train_loader)
 
         # Do GRPO - generate chains, score, compute advantage, compute loss 
@@ -508,6 +559,7 @@ if __name__ == "__main__":
         scheduler.step()
 
         # Step optimizer
+        # My note: only update weights every so many steps
         if (round_num + 1) % args.gradient_accumulation_steps == 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
             optimizer.step()

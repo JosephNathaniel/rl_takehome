@@ -1,5 +1,7 @@
 """
-Implementation of GRPO, DeepSeek style training without external libraries 
+Implementation of GRPO, DeepSeek style training without external libraries.
+To run in a distributed manner, use torchrun:
+torchrun --nproc_per_node=NUM_GPUS main_distributed.py [ARGS]
 """
 import os
 import json
@@ -8,6 +10,11 @@ import argparse
 from tqdm import tqdm
 from collections import defaultdict
 from transformers import PreTrainedModel, PreTrainedTokenizerBase, GenerationConfig
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader as TorchDataLoader
+import itertools
 
 import llms
 import utils
@@ -354,7 +361,7 @@ def compute_loss(
     return loss, metrics
 
 def grpo_loss(
-        model: PreTrainedModel,
+        model: DDP,
         base_model: PreTrainedModel,
         tokenizer: PreTrainedTokenizerBase,
         question: str,
@@ -392,7 +399,7 @@ def grpo_loss(
     # My note: three seq lengths at play. Prompt length, completion length, prompt+completion length
     # My note: attention mask same shape as prompt_completion_ids
     prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text = generate_completions(
-        model, tokenizer, question, device, args, loader
+        model.module, tokenizer, question, device, args, loader
     )
     # My note: if we're already using the normal model to rollout, doesn't this make the importance ratio redundant?
 
@@ -403,14 +410,15 @@ def grpo_loss(
     )
 
     # Write log data
-    log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
-    utils.write_generation_log(log_data, log_file)
+    if dist.get_rank() == 0:
+        log_file = os.path.join(training_log_dir, f'{round_num}_generations.txt')
+        utils.write_generation_log(log_data, log_file)
 
     # Compute loss
     # My note: completion_mask same shape as completion_ids
     completion_mask = attention_mask[:, prompt_ids.size(1):]
     loss, loss_metrics = compute_loss(
-        model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
+        model.module, base_model, prompt_completion_ids, prompt_ids, completion_ids,
         attention_mask, completion_mask, advantages, args
     )
 
@@ -463,14 +471,21 @@ def parse_args():
 
 if __name__ == "__main__":
 
+    # DDP setup
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = f"cuda:{local_rank}"
+    torch.cuda.set_device(device)
+
     # Get all args 
     args = parse_args() 
     
     # Seed everything 
-    utils.seed_everything(args.seed)
+    utils.seed_everything(args.seed + rank)
 
     # Set device and enable bf16
-    device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = True
     torch.set_float32_matmul_precision('high') 
 
@@ -481,9 +496,28 @@ if __name__ == "__main__":
     ## Set which model to train 
     model, tokenizer = llms.get_llm_tokenizer(args.model_name, device)
     base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
+    model = DDP(model, device_ids=[local_rank])
+
 
     ## Set which data set 
-    train_loader, test_loader = rl_datasets.get_dataloaders(args.dataset_name)
+    train_loader_custom, test_loader = rl_datasets.get_dataloaders(args.dataset_name)
+    train_sampler = DistributedSampler(train_loader_custom.dataset, num_replicas=world_size, rank=rank, shuffle=True)
+    
+    def collate_fn(batch):
+        return tuple(zip(*batch))
+
+    train_loader = TorchDataLoader(
+        train_loader_custom.dataset,
+        batch_size=1, # Process one question per GPU at a time
+        sampler=train_sampler,
+        collate_fn=collate_fn
+    )
+    
+    # To keep the nice properties of the custom loader, like system prompts
+    # we can create an iterator that we'll manually advance
+    train_loader_iter = iter(train_loader)
+
+
 
     ## Set which evaluation criteria to use 
     eval_class = evaluator.get_evaluator(args.evaluator)
@@ -492,15 +526,23 @@ if __name__ == "__main__":
 
 
     # Setup logging 
-    os.makedirs(args.output_dir, exist_ok=True)
-    args_dict = vars(args)
-    args_path = os.path.join(args.output_dir, 'args.json')
-    with open(args_path, 'w') as f:
-        json.dump(args_dict, f, indent=4)
+    if rank == 0:
+        os.makedirs(args.output_dir, exist_ok=True)
+        args_dict = vars(args)
+        args_path = os.path.join(args.output_dir, 'args.json')
+        with open(args_path, 'w') as f:
+            json.dump(args_dict, f, indent=4)
+        eval_log_dir = os.path.join(args.output_dir, 'eval_logs')
+        os.makedirs(eval_log_dir, exist_ok=True)
+        train_log_dir = os.path.join(args.output_dir, 'training_logs')
+        os.makedirs(train_log_dir, exist_ok=True)
+    
+    # Wait for main process to setup directories
+    dist.barrier()
+    
+    # Directories for all processes
     eval_log_dir = os.path.join(args.output_dir, 'eval_logs')
-    os.makedirs(eval_log_dir, exist_ok=True)
     train_log_dir = os.path.join(args.output_dir, 'training_logs')
-    os.makedirs(train_log_dir, exist_ok=True)
 
 
     # Setup optimizer for trainer agent with GRPO config settings
@@ -525,13 +567,15 @@ if __name__ == "__main__":
     accumulated_loss = 0
     optimizer.zero_grad()
     train_metrics_total = {}
-    # My note: this loop corresponds to getting a new (question, answer) pair?
-    for round_num in tqdm(range(args.num_train_iters), desc="Training Progress"):
     
+    # Use sampler to set epoch
+    for round_num in tqdm(range(args.num_train_iters), desc="Training Progress", disable=rank != 0):
+        train_sampler.set_epoch(round_num)
+
         # Evaluate on test set every so often 
-        if round_num % args.eval_iterations == 0:
+        if round_num % args.eval_iterations == 0 and rank == 0:
             eval_metrics, eval_accuracy = eval_on_test_set(
-                model=model,
+                model=model.module,
                 tokenizer=tokenizer, 
                 test_loader=test_loader,
                 eval_class=eval_class,
@@ -551,15 +595,21 @@ if __name__ == "__main__":
         # Slowly update ref model
         if args.update_ref_model and (round_num+1) % args.update_ref_model_freq == 0:
             with torch.no_grad():
-                for param, ref_param in zip(model.parameters(), base_model.parameters()):
+                for param, ref_param in zip(model.module.parameters(), base_model.parameters()):
                     ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
 
         # Get next question
-        # My note: a single (q,a) pair. Two strings? Answer is a minimal string
-        question, answer = next(train_loader)
+        try:
+            question_batch, answer_batch = next(train_loader_iter)
+            question, answer = question_batch[0], answer_batch[0]
+        except StopIteration:
+            # Re-create the iterator if it's exhausted
+            train_loader_iter = iter(train_loader)
+            question_batch, answer_batch = next(train_loader_iter)
+            question, answer = question_batch[0], answer_batch[0]
 
         # Do GRPO - generate chains, score, compute advantage, compute loss 
-        total_loss, train_metrics = grpo_loss(model, base_model, tokenizer, question, answer, eval_class, device, round_num, train_log_dir, args, train_loader)
+        total_loss, train_metrics = grpo_loss(model, base_model, tokenizer, question, answer, eval_class, device, round_num, train_log_dir, args, train_loader_custom)
         
         # Gradient accumulation
         total_loss = total_loss # / args.gradient_accumulation_steps
@@ -575,10 +625,13 @@ if __name__ == "__main__":
             optimizer.zero_grad()    
 
         # Logs
-        train_metrics["learning_rate"] = scheduler.get_last_lr()[0]
-        train_metrics["loss"] = total_loss.item() * args.gradient_accumulation_steps
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
-        train_metrics["grad_norm"] = grad_norm
-        train_metrics_total[round_num] = train_metrics
-        with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:
-            json.dump(train_metrics_total, f, indent=4)
+        if rank == 0:
+            train_metrics["learning_rate"] = scheduler.get_last_lr()[0]
+            train_metrics["loss"] = total_loss.item() * args.gradient_accumulation_steps
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf')).item()
+            train_metrics["grad_norm"] = grad_norm
+            train_metrics_total[round_num] = train_metrics
+            with open(os.path.join(train_log_dir, "train_logs.json"), "w") as f:
+                json.dump(train_metrics_total, f, indent=4)
+    
+    dist.destroy_process_group()

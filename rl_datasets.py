@@ -6,7 +6,8 @@ Hold all data sets
 import random
 import numpy as np
 from tqdm import tqdm
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
+from torch.utils.data import Dataset as TorchDataset
 from abc import ABC, abstractmethod
 from typing import Tuple, Any
 
@@ -64,6 +65,17 @@ Respond in the following format:
 
 
 
+class GSM8KDataset(TorchDataset):
+    def __init__(self, questions: list[str], answers: list[str]):
+        self.questions = questions
+        self.answers = answers
+
+    def __len__(self):
+        return len(self.questions)
+
+    def __getitem__(self, idx):
+        return self.questions[idx], self.answers[idx]
+
 class GSM8KLoader(DataLoader):
     """
     A loader class that provides iteration over GSM8K math problems.
@@ -81,6 +93,7 @@ class GSM8KLoader(DataLoader):
     
     def __init__(self, questions: list[str], answers: list[str], random: bool = False) -> None:
         super().__init__(random)
+        self.dataset = GSM8KDataset(questions, answers)
         self.questions = questions
         self.answers = answers
         self.pre_prompt = """You will be given a question that involves reasoning. You should reason carefully about the question, then provide your answer.

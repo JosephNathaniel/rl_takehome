@@ -119,10 +119,10 @@ def get_per_token_logps(model, input_ids, attention_mask, logits_to_keep: int):
     """
     # We add 1 to `logits_to_keep` because the last logits of the sequence is later excluded
     # My note: initially here, logits is (batch, logits_to_keep+1,vocab)
-    # My note: the attention_mask below is to deal with padding. But given padding is on the right and attention is causal, this doesn't actually do much?
+    # the attention_mask is for padding. But given padding is on the right and attention is causal, this doesn't actually do much?
     logits = model(input_ids=input_ids, attention_mask=attention_mask, logits_to_keep=logits_to_keep + 1).logits
+    # My note: at this point, logits is (b, logits_to_keep+1=completion_length+1, v), corresponding to the COMPLETION tokens
     logits = logits[:, :-1, :]  # (B, L-1, V), exclude the last logit: it corresponds to the next token pred
-    # My note: at this point, logits is (b, logits_to_keep=completion_length, v), corresponding to the COMPLETION tokens
 
     # My note: take the FINAL completion-many correct token ids
     input_ids = input_ids[:, -logits_to_keep:]

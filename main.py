@@ -135,19 +135,24 @@ def generate_completions(
     """
     # 1. Prepare prompting
     prompt = [
-        {'role': 'system', 'content': train_loader.system_prompt},
+        {'role': 'system', 'content': train_loader.system_prompt}, # My note: this contains the instructions about <reasoning> and <answer> tags
         {'role': 'user', 'content': question}
     ]
-    prompt_text = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    # My note: essentially, apply_chat_template puts SYSTEM PROMPT at the start, then the user question (along with some more wrapping tags) 
+    prompt_text: str = tokenizer.apply_chat_template(prompt, tokenize=False, add_generation_prompt=True)
+    # My note: the padding below shouldn't do anything here, because it's just one string
     prompt_inputs = tokenizer(prompt_text, return_tensors="pt", padding=True, padding_side="left", add_special_tokens=False)
+    # My note: these are two integer tensors of shape (1, prompt_length)
     prompt_ids, prompt_mask = prompt_inputs["input_ids"], prompt_inputs["attention_mask"]
 
     # Truncate prompt to max length and repeat for number of generations
-    # My note: I believe, if it's already shorter than max length, then nothing happens
+    # My note: if it's already shorter than max length, then nothing happens
+    # Note also we take the ending of the prompt, possibly losing the start
     prompt_ids = prompt_ids[:, -args.max_prompt_length:]
     prompt_mask = prompt_mask[:, -args.max_prompt_length:]
     
     # Repeat for number of chains/generations
+    # My note: tensors are now (num_chains, prompt_length), with all rows the same
     prompt_ids = prompt_ids.repeat(args.num_chains, 1)
     prompt_mask = prompt_mask.repeat(args.num_chains, 1)
 
@@ -168,28 +173,34 @@ def generate_completions(
     with torch.no_grad():
         prompt_completion_ids = model.generate(
             prompt_ids,
-            attention_mask=prompt_mask,
+            attention_mask=prompt_mask, # My note: in practice this is all 1s
             generation_config=generation_config
         )
+    # My note: prompt_completion_ids seq dim is now some arbitrary L?
+    # Where L is prompt_length + completion_length. I.e. prompt_completion_ids[:,:prompt_length] = prompt_ids
 
     # Extract completion ids
     prompt_length = prompt_ids.size(1)
-    prompt_ids = prompt_completion_ids[:, :prompt_length]
+    prompt_ids = prompt_completion_ids[:, :prompt_length] # this line is pointless?
     completion_ids = prompt_completion_ids[:, prompt_length:]
 
     # Do masking 
+    # My note: subtle point here. The tokenizer.eos_token_id is used as closing brackets in the prompt
+    # But here we are just dealing with the completion part, so it should be fine
     is_eos = completion_ids == tokenizer.eos_token_id
+    # My note: eos_idx seems to be index of first eos token in each batch item
     eos_idx = torch.full((is_eos.size(0),), is_eos.size(1), dtype=torch.long, device=device)
     eos_idx[is_eos.any(dim=1)] = is_eos.int().argmax(dim=1)[is_eos.any(dim=1)]
     sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
     completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
+    # My note: this completion mask includes the first eos token
 
-    # My note: (batch_size, seq_length)? batch_size is number of parallel generations
-    # I think this is just a padding mask for the completion part
+    # My note: (batch_size, prompt+completion length)
+    # padding mask for the prompt_completion_ids
     attention_mask = torch.cat([prompt_mask, completion_mask], dim=1)
 
     # Decode completions
-    completions_text = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
+    completions_text: list[str] = tokenizer.batch_decode(completion_ids, skip_special_tokens=True) # My note: I think this still KEEPS <reasoning> and <answer> tags
 
     return prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text
     
@@ -229,9 +240,11 @@ def score_completions(
     }
 
     # Format inputs as expected by evaluator
+    # My note: both lists are num_chains long
     mock_prompts = [[{'content': question}]] * len(completions_text)
     mock_completions = [[{'content': completion}] for completion in completions_text]
-    answers = [answer] * len(completions_text)
+    # My note: just makes a bunch of copies of the correct answer
+    answers: list[str] = [answer] * len(completions_text)
     
     # Get rewards and metrics from evaluator
     rewards_per_func, metrics = eval_class.compute_rewards(
@@ -240,7 +253,7 @@ def score_completions(
         answer=answers,
         device=device
     )
-    rewards = rewards_per_func.sum(dim=1)
+    rewards = rewards_per_func.sum(dim=1) # rewards_per_func is (num_chains, num_reward_functions)
 
     # Store generation data
     for i, (completion, reward_scores) in enumerate(zip(completions_text, rewards_per_func)):
@@ -254,9 +267,12 @@ def score_completions(
         log_data['generations'].append(generation_data)
 
     # Compute advantages
+    # My note: recall view is like reshape. Below gives a one entry tensor, containing mean and std for the group
+    # In our case, this is a little weird. Just do rewards.mean() and rewards.std() instead?
     mean_grouped_rewards = rewards.view(-1, args.num_chains).mean(dim=1)
     std_grouped_rewards = rewards.view(-1, args.num_chains).std(dim=1)
 
+    # My note: below expands them out to a bunch of copies
     mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(args.num_chains, dim=0)
     std_grouped_rewards = std_grouped_rewards.repeat_interleave(args.num_chains, dim=0)
 
@@ -307,7 +323,7 @@ def compute_loss(
         model,
         prompt_completion_ids,
         attention_mask,
-        logits_to_keep=completion_ids.size(1)
+        logits_to_keep=completion_ids.size(1) # this is an integer helping to identify where prompt ends/completion starts
     )
     # My note: log_probs is now (num_chains, completion_length)
 
@@ -327,17 +343,17 @@ def compute_loss(
     # Per token policy objective
     # NOTE: I think there's something dodgy here with the importance sampling ratio
     # because we're using the model, rather than the base_model, to generate rollouts
-    # pg_objective = advantages.unsqueeze(-1) * torch.exp(log_probs - base_log_probs)
+    pg_objective = advantages.unsqueeze(-1) * torch.exp(log_probs - base_log_probs)
     # again, this will need masking
 
-    # ALTERNATIVE VERSION:
-    pg_objective = advantages.unsqueeze(-1) * log_probs
+    # ALTERNATIVE LOGPROB VERSION:
+    # pg_objective = advantages.unsqueeze(-1) * log_probs
 
     per_token_loss = -pg_objective + args.kl_weight_beta * kl
     per_token_loss = per_token_loss * completion_mask  # Apply completion mask
 
     # average along completion length
-    per_completion_loss = per_token_loss.sum(dim=1) / completion_mask.sum(dim=1)
+    per_completion_loss = per_token_loss.sum(dim=1) / completion_mask.sum(dim=1).clamp(min=1.0)  # Avoid division by zero
     # mean across batch
     loss = per_completion_loss.mean()
 
@@ -346,7 +362,6 @@ def compute_loss(
     metrics = {
         "response_length": completion_mask.sum(dim=1).float().mean().item(),
         "kl": kl.mean().item(),
-        "learning_rate": args.learning_rate  # Assuming args has learning rate
     }
 
     return loss, metrics
@@ -384,9 +399,9 @@ def grpo_loss(
         reward: The total reward for this batch
     """
     # Generate completions
-    # My note: each tensor is 2D, with batch dim = num_chains as 0th
-    # My note: three seq lengths at play. Prompt length, completion length, prompt+completion length
-    # My note: attention mask same shape as prompt_completion_ids
+    # My notes: each tensor is 2D, with 0th batch dim = args.num_chains
+    # meanwhile, three seq lengths at play. Prompt length, completion length, prompt+completion length
+    # attention mask same shape as prompt_completion_ids
     prompt_completion_ids, prompt_ids, completion_ids, attention_mask, completions_text, prompt_text = generate_completions(
         model, tokenizer, question, device, args
     )
@@ -405,10 +420,12 @@ def grpo_loss(
     # Compute loss
     # My note: completion_mask same shape as completion_ids
     completion_mask = attention_mask[:, prompt_ids.size(1):]
+    # My note: compute_loss was meant to be the only implementation
     loss, loss_metrics = compute_loss(
         model, base_model, prompt_completion_ids, prompt_ids, completion_ids,
         attention_mask, completion_mask, advantages, args
     )
+    # My note: lot of the args are redundant. prompt_completion_ids/attention_mask make other ids/mask redundant (if we know prompt_length)
 
     # Combine metrics
     metrics.update(loss_metrics)
@@ -438,7 +455,7 @@ def parse_args():
     parser.add_argument("--max_grad_norm", type=float, default=0.1, help="Max gradient norm for clipping")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of gradient accumulation steps")
     parser.add_argument("--warmup_percent", type=float, default=0.18, help="Percentage of total steps for warmup")
-    parser.add_argument("--update_ref_model", action="store_true", help="Whether to update reference model")
+    parser.add_argument("--update_ref_model", action="store_true", help="Whether to update reference model") # My note: defaults to False if --update_ref_model flag is not present
     parser.add_argument("--update_ref_model_freq", type=int, default=200, help="How often to update reference model")
     parser.add_argument("--ref_model_mixup_alpha", type=float, default=0.1, help="Alpha parameter for reference model mixup")
 
@@ -525,7 +542,7 @@ if __name__ == "__main__":
     accumulated_loss = 0
     optimizer.zero_grad()
     train_metrics_total = {}
-    # My note: this loop corresponds to getting a new (question, answer) pair?
+    # My note: this loop corresponds to getting a new (question, answer) pair
     for round_num in tqdm(range(args.num_train_iters), desc="Training Progress"):
     
         # Evaluate on test set every so often 
@@ -555,14 +572,14 @@ if __name__ == "__main__":
                     ref_param.data = args.ref_model_mixup_alpha * param.data + (1 - args.ref_model_mixup_alpha) * ref_param.data
 
         # Get next question
-        # My note: a single (q,a) pair. Two strings? Answer is a minimal string
+        # My note: a single (question: str, answer: str) pair
         question, answer = next(train_loader)
 
         # Do GRPO - generate chains, score, compute advantage, compute loss 
         total_loss, train_metrics = grpo_loss(model, base_model, tokenizer, question, answer, eval_class, device, round_num, train_log_dir, args)
         
         # Gradient accumulation
-        total_loss = total_loss # / args.gradient_accumulation_steps
+        total_loss = total_loss
         total_loss.backward()
         accumulated_loss += total_loss.item()
         scheduler.step()

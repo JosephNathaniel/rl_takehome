@@ -1,6 +1,7 @@
 # My addition: Ignore output, .vscode directories
 output/
-.vscode/
+.vscode/*
+!.vscode/launch.json
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

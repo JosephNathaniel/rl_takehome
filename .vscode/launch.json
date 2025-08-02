@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug main.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/main.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--model_name", "Qwen/Qwen2-0.5B-Instruct",
+                "--dataset_name", "gsm8k",
+                "--evaluator", "gsm8k",
+                "--output_dir", "output/debug",
+                "--num_train_iters", "10",
+                "--save_steps", "5",
+                "--eval_iterations", "5",
+                "--gradient_accumulation_steps", "1",
+                "--num_chains", "4",
+                "--verbose"
+            ]
+        }
+    ]
+}

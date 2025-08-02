@@ -420,12 +420,12 @@ def parse_args():
     parser = argparse.ArgumentParser(description="GRPO training arguments")
     
     # Model configuration
-    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2.5-1.5B-Instruct", help="Name/path of base model")
+    parser.add_argument("--model_name", type=str, default="Qwen/Qwen2-0.5B-Instruct", help="Name/path of base model")
     parser.add_argument("--dataset_name", type=str, default="gsm8k", help="Dataset to use for training")
     parser.add_argument("--evaluator", type=str, default="gsm8k", help="Evaluator to use for scoring")
 
     # Output and logging
-    parser.add_argument("--output_dir", type=str, default="output/Qwen2.5-1.5B-Instruct", help="Directory to save outputs")
+    parser.add_argument("--output_dir", type=str, default="output/Qwen2-0.5B-Instruct", help="Directory to save outputs")
     parser.add_argument("--verbose", action="store_true", help="Enable verbose logging")
     parser.add_argument("--save_steps", type=int, default=100, help="Save model every N steps")
     parser.add_argument("--eval_iterations", type=int, default=20, help="Number of iterations for evaluation")

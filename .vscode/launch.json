@@ -12,11 +12,11 @@
                 "--dataset_name", "gsm8k",
                 "--evaluator", "gsm8k",
                 "--output_dir", "output/debug",
-                "--num_train_iters", "10",
-                "--save_steps", "5",
-                "--eval_iterations", "5",
-                "--gradient_accumulation_steps", "1",
-                "--num_chains", "4",
+                "--num_train_iters", "1000",
+                "--save_steps", "100",
+                "--eval_iterations", "20",
+                "--gradient_accumulation_steps", "4",
+                "--num_chains", "16",
                 "--verbose"
             ]
         }

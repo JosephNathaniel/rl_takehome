@@ -479,8 +479,8 @@ if __name__ == "__main__":
     base_model, _ = llms.get_llm_tokenizer(args.model_name, device)
 
     # My note: bfloat to reduce memory usage
-    model = model.to(torch.bfloat16)
-    base_model = base_model.to(torch.bfloat16)
+    # model = model.to(torch.bfloat16)
+    # base_model = base_model.to(torch.bfloat16)
 
     ## Set which data set 
     train_loader, test_loader = rl_datasets.get_dataloaders(args.dataset_name)

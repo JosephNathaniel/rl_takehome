@@ -17,6 +17,8 @@
                 "--eval_iterations", "20",
                 "--gradient_accumulation_steps", "4",
                 "--num_chains", "16",
+                "--update_ref_model",
+                "--update_ref_model_freq", "200",
                 "--verbose"
             ]
         }

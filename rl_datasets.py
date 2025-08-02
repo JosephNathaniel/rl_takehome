@@ -73,8 +73,8 @@ class GSM8KLoader(DataLoader):
     in order or randomly, making it suitable for both training and evaluation.
     
     Attributes:
-        questions (List[str]): List of math question strings
-        answers (List[str]): List of corresponding answer strings
+        questions (list[str]): List of math question strings
+        answers (list[str]): List of corresponding answer strings
         random (bool): If True, returns problems randomly; if False, returns sequentially
         current_index (int): Current position in the lists for sequential access
     """
@@ -107,6 +107,9 @@ class GSM8KLoader(DataLoader):
         return self
         
     def __next__(self) -> tuple[str, str]:
+        """
+        Just returns one (question: str, answer: str) pair
+        """
         if self.current_index >= len(self.questions):
             raise StopIteration
         
@@ -123,11 +126,17 @@ class GSM8KLoader(DataLoader):
 
 
 def build_gsm8k_dataloaders() -> Tuple[GSM8KLoader, GSM8KLoader]: 
+    """
+    My notes: takes the gsm8k train set.
+    Does processing to extract questions and answers
+    Then randomly splits the data into 99/1 train/test sets
+    """
+    # 7473 (question: str, answer: str) pairs
     data = load_dataset('openai/gsm8k', 'main')["train"]
 
-    questions = []
-    parsed_answers = [] 
-    for i in tqdm(range(len(data)), desc="Processing"):
+    questions: list[str] = []
+    parsed_answers: list[str] = [] 
+    for i in tqdm(range(len(data)), desc="Processing dataset"):
         # Try to get answer - if is None dont use this sample 
         ans = extract_hash_answer(data[i]['answer'])
         if ans is None: 
@@ -137,8 +146,8 @@ def build_gsm8k_dataloaders() -> Tuple[GSM8KLoader, GSM8KLoader]:
             parsed_answers.append(ans)
 
     # Randomly split into train/test sets
-    total_samples = len(questions)
-    test_size = int(total_samples * 0.01)  # 10% for test set
+    total_samples = len(questions) # all 7473 are successfully parsed
+    test_size = int(total_samples * 0.01)  # 1% for test set
     
     # Generate random indices for test set
     test_indices = random.sample(range(total_samples), test_size)

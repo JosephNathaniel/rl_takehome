@@ -165,6 +165,7 @@ def generate_completions(
         max_new_tokens=args.max_completion_length,
         do_sample=True, 
         temperature=args.temperature,
+        top_p=args.top_p,
         pad_token_id=tokenizer.pad_token_id
     )
 
@@ -462,6 +463,7 @@ def parse_args():
 
     # Generation parameters
     parser.add_argument("--temperature", type=float, default=0.9, help="Sampling temperature")
+    parser.add_argument("--top_p", type=float, default=None, help="Top-p sampling")
     parser.add_argument("--num_chains", type=int, default=16, help="Number of parallel generation chains")
     parser.add_argument("--max_prompt_length", type=int, default=256, help="Maximum prompt length")
     parser.add_argument("--max_completion_length", type=int, default=786, help="Maximum completion length")

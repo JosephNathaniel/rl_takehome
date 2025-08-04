@@ -153,8 +153,8 @@ def generate_completions(
     
     # Repeat for number of chains/generations
     # My note: tensors are now (num_chains, prompt_length), with all rows the same
-    prompt_ids = prompt_ids.repeat(args.num_chains, 1)
-    prompt_mask = prompt_mask.repeat(args.num_chains, 1)
+    # prompt_ids = prompt_ids.repeat(args.num_chains, 1)
+    # prompt_mask = prompt_mask.repeat(args.num_chains, 1)
 
     # Move tensors to device
     prompt_ids = prompt_ids.to(device)
@@ -169,14 +169,46 @@ def generate_completions(
         pad_token_id=tokenizer.pad_token_id
     )
 
+
+    # temporary change: generate sequentially
+    all_prompt_completion_ids = []
+    for _ in range(args.num_chains):
+        with torch.no_grad():
+            # Generate a single completion
+            prompt_completion_id = model.generate(
+                prompt_ids,
+                attention_mask=prompt_mask,
+                generation_config=generation_config
+            )
+            all_prompt_completion_ids.append(prompt_completion_id)
+
+    # Pad all generated sequences to the same length
+    # First, find the max length in the batch
+    max_length = max(pc_id.shape[1] for pc_id in all_prompt_completion_ids)
+
+    # Now, pad each sequence to max_length and create a list of padded tensors
+    padded_ids_list = []
+    for pc_id in all_prompt_completion_ids:
+        padding_needed = max_length - pc_id.shape[1]
+        if padding_needed > 0:
+            padding = torch.full((1, padding_needed), tokenizer.pad_token_id, dtype=torch.long, device=device)
+            padded_id = torch.cat([pc_id, padding], dim=1)
+            padded_ids_list.append(padded_id)
+        else:
+            padded_ids_list.append(pc_id)
+
+    # Concatenate the list of padded tensors into a single batch tensor
+    prompt_completion_ids = torch.cat(padded_ids_list, dim=0)
+
+
     # Generate completions
     # My note: added torch no grad
-    with torch.no_grad():
-        prompt_completion_ids = model.generate(
-            prompt_ids,
-            attention_mask=prompt_mask, # My note: in practice this is all 1s
-            generation_config=generation_config
-        )
+    # with torch.no_grad():
+    #     prompt_completion_ids = model.generate(
+    #         prompt_ids,
+    #         attention_mask=prompt_mask, # My note: in practice this is all 1s
+    #         generation_config=generation_config
+    #     )
     # My note: prompt_completion_ids seq dim is now some arbitrary L?
     # Where L is prompt_length + completion_length. I.e. prompt_completion_ids[:,:prompt_length] = prompt_ids
 
@@ -195,6 +227,8 @@ def generate_completions(
     sequence_indices = torch.arange(is_eos.size(1), device=device).expand(is_eos.size(0), -1)
     completion_mask = (sequence_indices <= eos_idx.unsqueeze(1)).int()
     # My note: this completion mask includes the first eos token
+
+    prompt_mask = prompt_mask.repeat(args.num_chains, 1)
 
     # My note: (batch_size, prompt+completion length)
     # padding mask for the prompt_completion_ids

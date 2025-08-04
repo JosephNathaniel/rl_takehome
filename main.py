@@ -86,7 +86,7 @@ def eval_on_test_set(
             f.write("Metrics:\n")
             for metric, value in metrics.items():
                 f.write(f"{metric}: {value}\n")
-            f.write(f"Total Score: {rewards_per_func.sum().item()}\n")
+            f.write(f"Total Score across group: {rewards_per_func.sum().item()}\n")
 
 
     # Calculate averages

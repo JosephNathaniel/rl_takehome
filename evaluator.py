@@ -92,15 +92,20 @@ class GSM8kEvaluator(RewardEvaluator):
     - XML formatting (strict and soft)
     - XML tag counting
     """
+    ANSWER_RE = re.compile(r"<answer>\s*(.*?)\s*</answer>", re.DOTALL)
     
     def __init__(self):
         self.num_reward_functions = 5
     
+    # New extractor, that handles missing tags
+    # This method tries to be fairly forgiving, pulling out whatever sits between <answer> and </answer>
     def _extract_xml_answer(self, text: str) -> str:
-        """Extract answer from XML tags."""
-        answer = text.split("<answer>")[-1]
-        answer = answer.split("</answer>")[0]
-        return answer.strip()
+        """
+        Extract answer from <answer>…</answer>. 
+        Returns the inner text (stripped), or "" if tags are missing.
+        """
+        m = self.ANSWER_RE.search(text)
+        return m.group(1).strip() if m else ""
     
     def _correctness_reward(self, prompts, completions, answer) -> List[float]:
         """Reward for correct answer."""
@@ -114,35 +119,48 @@ class GSM8kEvaluator(RewardEvaluator):
         extracted = [self._extract_xml_answer(r) for r in responses]
         return [0.5 if r.isdigit() else 0.0 for r in extracted]
 
+    # New strict format reward that allows newlines inside the blocks
     def _strict_format_reward(self, completions) -> List[float]:
-        """Reward for strict XML format."""
-        pattern = r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$"
-        responses = [completion[0]["content"] for completion in completions]
-        matches = [bool(re.match(pattern, r)) for r in responses]
-        return [0.5 if m else 0.0 for m in matches]
+        """Reward for strict XML format, allowing newlines inside the blocks."""
+        pattern = re.compile(
+            r"^<reasoning>\n.*?\n</reasoning>\n<answer>\n.*?\n</answer>\n$",
+            flags=re.DOTALL
+        )
+        responses = [c[0]["content"] for c in completions]
+        return [0.5 if pattern.match(r) else 0.0 for r in responses]
 
+    # New soft format reward that allows newlines in reasoning/answer
     def _soft_format_reward(self, completions) -> List[float]:
-        """Reward for relaxed XML format."""
-        pattern = r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>"
-        responses = [completion[0]["content"] for completion in completions]
-        matches = [bool(re.match(pattern, r)) for r in responses]
-        return [0.5 if m else 0.0 for m in matches]
+        """Reward for relaxed XML format, allowing newlines in reasoning/answer."""
+        pattern = re.compile(
+            r"<reasoning>.*?</reasoning>\s*<answer>.*?</answer>",
+            flags=re.DOTALL
+        )
+        responses = [c[0]["content"] for c in completions]
+        # use search so that extra leading/trailing text won’t block a match
+        return [0.5 if pattern.search(r) else 0.0 for r in responses]
 
-    def _xml_count_reward(self, completions) -> List[float]:
-        """Reward for XML tag counting."""
+    # New xml count reward that only penalizes trailing text after </answer>
+    def _xml_count_reward(self, completions) -> list[float]:
+        """Reward for XML tag counting, with penalty only on text after </answer>."""
         def count_xml(text: str) -> float:
             count = 0.0
-            if text.count("<reasoning>\n") == 1: count += 0.125
-            if text.count("\n</reasoning>\n") == 1: count += 0.125
-            if text.count("\n<answer>\n") == 1:
+            # rewards for each tag appearing exactly once
+            if text.count("<reasoning>") == 1: count += 0.125
+            if text.count("</reasoning>") == 1: count += 0.125
+            if text.count("<answer>") == 1: count += 0.125
+
+            # only penalize trailing content if we actually saw exactly one closing </answer>
+            if text.count("</answer>") == 1:
                 count += 0.125
-                count -= len(text.split("\n</answer>\n")[-1])*0.001
-            if text.count("\n</answer>") == 1:
-                count += 0.125
-                count -= (len(text.split("\n</answer>")[-1]) - 1)*0.001
+                # find the end of the tag, then measure only what's after it
+                end_idx = text.find("</answer>") + len("</answer>")
+                trailing = text[end_idx:]
+                count -= len(trailing) * 0.001
+
             return count
-            
-        responses = [completion[0]["content"] for completion in completions]
+        
+        responses = [completion[0]['content'] for completion in completions]
         return [count_xml(r) for r in responses]
 
     def compute_rewards(
@@ -171,6 +189,7 @@ class GSM8kEvaluator(RewardEvaluator):
             rewards_per_func[:, i] = torch.tensor(scores, dtype=torch.float32, device=device)
         
         # Compute metrics
+        # My note: this is the average reward across the group, for each reward function
         reward_per_func = rewards_per_func.mean(0)
         
         # Calculate accuracy (perfect correctness score)
